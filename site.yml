@@ -1,0 +1,331 @@
+---
+- name: Provision Convex self-hosted on DigitalOcean
+  hosts: convex
+  become: true
+  vars:
+    # 🔧 CHANGE THESE
+    droplet_ip: "203.0.113.10" # your DO droplet public IPv4
+    domain_base: "englishbystories.com" # root domain
+    letsencrypt_email: "you@example.com" # email for certbot/renewals
+
+    # Optional: basic auth for dashboard
+    enable_dashboard_basic_auth: false
+    dashboard_basic_auth_user: "admin"
+    dashboard_basic_auth_password: "changeme-long"
+
+    # Internal ports used by Convex containers
+    convex_api_port: 3210
+    convex_actions_port: 3211
+    convex_dashboard_port: 6791
+
+    convex_root: /opt/convex
+    nginx_conf_path: /etc/nginx/conf.d/convex.conf
+
+  pre_tasks:
+    - name: Ensure APT is fresh
+    - apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install base packages (nginx, ufw, snapd, tools)
+      apt:
+        name:
+          - nginx
+          - ufw
+          - ca-certificates
+          - curl
+          - gnupg
+          - software-properties-common
+          - python3-apt
+        state: present
+
+    - name: Ensure snapd core & certbot installed
+      shell: |
+        snap install core && snap refresh core
+        snap install --classic certbot
+        ln -sf /snap/bin/certbot /usr/bin/certbot
+      args: { creates: /usr/bin/certbot }
+
+    - name: Open HTTP/HTTPS and SSH in UFW
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+      loop: ["22", "80", "443"]
+
+    - name: Enable UFW (non-interactive)
+      ufw:
+        state: enabled
+      register: ufw_enabled
+      failed_when: false
+
+  tasks:
+    # ---------------- Docker (official repo) ----------------
+    - name: Add Docker GPG key
+      shell: |
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        chmod a+r /etc/apt/keyrings/docker.gpg
+      args: { creates: /etc/apt/keyrings/docker.gpg }
+
+    - name: Add Docker apt repo
+      copy:
+        dest: /etc/apt/sources.list.d/docker.list
+        content: |
+          deb [arch={{ ansible_architecture | default('amd64') }} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ansible_lsb.codename }} stable
+
+    - name: Install Docker Engine + Compose plugin
+      apt:
+        update_cache: true
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+
+    - name: Enable & start docker
+      systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    # ---------------- Convex files & compose ----------------
+    - name: Create convex root
+      file:
+        path: "{{ convex_root }}"
+        state: directory
+        mode: "0755"
+
+    - name: Fetch Convex docker-compose.yml
+      get_url:
+        url: https://raw.githubusercontent.com/get-convex/convex-backend/main/self-hosted/docker/docker-compose.yml
+        dest: "{{ convex_root }}/docker-compose.yml"
+        mode: "0644"
+
+    - name: Write Convex .env for self-hosted routing
+      copy:
+        dest: "{{ convex_root }}/.env"
+        mode: "0640"
+        content: |
+          CONVEX_CLOUD_ORIGIN=https://api.{{ domain_base }}
+          CONVEX_SITE_ORIGIN=https://{{ domain_base }}
+          NEXT_PUBLIC_DEPLOYMENT_URL=https://api.{{ domain_base }}
+
+    - name: Pull & start Convex containers
+      community.docker.docker_compose_v2:
+        project_src: "{{ convex_root }}"
+        state: present
+        pull: always
+
+    - name: Generate admin key (idempotent best-effort)
+      shell: |
+        set -e
+        cd "{{ convex_root }}"
+        docker compose exec -T backend ./generate_admin_key.sh
+      register: convex_admin_key_raw
+      changed_when: false
+      failed_when: convex_admin_key_raw.rc != 0 and ('already exists' not in convex_admin_key_raw.stderr | default(''))
+
+    - name: Extract admin key value
+      set_fact:
+        convex_admin_key: "{{ convex_admin_key_raw.stdout | trim }}"
+
+    - name: Save admin key to root
+      copy:
+        dest: /root/convex_admin_key.txt
+        mode: "0600"
+        content: "{{ convex_admin_key | default('UNKNOWN - re-run generate_admin_key.sh') }}"
+
+    - name: Show admin key (you should rotate/regenerate later)
+      debug:
+        msg: "Convex Admin Key: {{ convex_admin_key | default('UNKNOWN - re-run generate_admin_key.sh') }}"
+
+    # ---------------- Nginx reverse proxy ----------------
+    - name: Render Nginx config
+      copy:
+        dest: "{{ nginx_conf_path }}"
+        mode: "0644"
+        content: |
+          map $http_upgrade $connection_upgrade {
+            default upgrade;
+            ''      close;
+          }
+
+          # Convex API -> :{{ convex_api_port }}
+          server {
+            listen 80;
+            server_name api.{{ domain_base }};
+
+            location / {
+              proxy_pass         http://127.0.0.1:{{ convex_api_port }};
+              proxy_http_version 1.1;
+              proxy_set_header   Host $host;
+              proxy_set_header   X-Real-IP $remote_addr;
+              proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header   X-Forwarded-Proto $scheme;
+              proxy_set_header   Upgrade $http_upgrade;
+              proxy_set_header   Connection $connection_upgrade;
+              proxy_read_timeout  300s;
+              proxy_send_timeout  300s;
+              proxy_connect_timeout 60s;
+              client_max_body_size 25m;
+            }
+
+            add_header X-Content-Type-Options nosniff;
+            add_header X-Frame-Options DENY;
+            add_header Referrer-Policy strict-origin-when-cross-origin;
+          }
+
+          # HTTP actions -> :{{ convex_actions_port }}
+          server {
+            listen 80;
+            server_name {{ domain_base }};
+
+            location / {
+              proxy_pass         http://127.0.0.1:{{ convex_actions_port }};
+              proxy_http_version 1.1;
+              proxy_set_header   Host $host;
+              proxy_set_header   X-Real-IP $remote_addr;
+              proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header   X-Forwarded-Proto $scheme;
+              proxy_set_header   Upgrade $http_upgrade;
+              proxy_set_header   Connection $connection_upgrade;
+              proxy_read_timeout  300s;
+              proxy_send_timeout  300s;
+              proxy_connect_timeout 60s;
+              client_max_body_size 25m;
+            }
+
+            add_header X-Content-Type-Options nosniff;
+            add_header X-Frame-Options DENY;
+            add_header Referrer-Policy strict-origin-when-cross-origin;
+          }
+
+          # Dashboard -> :{{ convex_dashboard_port }}
+          server {
+            listen 80;
+            server_name dashboard.{{ domain_base }};
+
+            {{ '# Basic auth block will be inserted below by Ansible if enabled' }}
+
+            location / {
+              proxy_pass         http://127.0.0.1:{{ convex_dashboard_port }};
+              proxy_http_version 1.1;
+              proxy_set_header   Host $host;
+              proxy_set_header   X-Real-IP $remote_addr;
+              proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header   X-Forwarded-Proto $scheme;
+              proxy_set_header   Upgrade $http_upgrade;
+              proxy_set_header   Connection $connection_upgrade;
+              proxy_read_timeout  300s;
+              proxy_send_timeout  300s;
+              proxy_connect_timeout 60s;
+              client_max_body_size 25m;
+            }
+
+            add_header X-Content-Type-Options nosniff;
+            add_header X-Frame-Options DENY;
+            add_header Referrer-Policy strict-origin-when-cross-origin;
+          }
+
+    - name: Insert Basic Auth into dashboard server (if enabled)
+      blockinfile:
+        path: "{{ nginx_conf_path }}"
+        insertafter: "server_name dashboard.{{ domain_base }};"
+        block: |
+          auth_basic "Restricted";
+          auth_basic_user_file /etc/nginx/.htpasswd_convex;
+      when: enable_dashboard_basic_auth
+
+    - name: Create Basic Auth user file (if enabled)
+      when: enable_dashboard_basic_auth
+      block:
+        - name: Install htpasswd tool
+          apt:
+            name: apache2-utils
+            state: present
+
+        - name: Create .htpasswd_convex
+          community.general.htpasswd:
+            path: /etc/nginx/.htpasswd_convex
+            name: "{{ dashboard_basic_auth_user }}"
+            password: "{{ dashboard_basic_auth_password }}"
+            crypt_scheme: bcrypt
+
+    - name: Test & reload Nginx
+      shell: nginx -t
+      register: nginx_test
+      changed_when: false
+
+    - name: Reload Nginx
+      systemd:
+        name: nginx
+        state: reloaded
+      when: nginx_test.rc == 0
+
+    # ---------------- DNS sanity check ----------------
+    - name: Verify DNS resolves api.{{ domain_base }} to droplet IP
+      command: getent hosts api.{{ domain_base }}
+      register: dns_api
+      changed_when: false
+
+    - name: Fail if api DNS does not match droplet_ip
+      fail:
+        msg: "DNS for api.{{ domain_base }} does not resolve to {{ droplet_ip }}. Fix DNS and re-run."
+      when: droplet_ip not in (dns_api.stdout | default(''))
+
+    - name: Verify DNS resolves dashboard.{{ domain_base }} to droplet IP
+      command: getent hosts dashboard.{{ domain_base }}
+      register: dns_dash
+      changed_when: false
+
+    - name: Fail if dashboard DNS does not match droplet_ip
+      fail:
+        msg: "DNS for dashboard.{{ domain_base }} does not resolve to {{ droplet_ip }}. Fix DNS and re-run."
+      when: droplet_ip not in (dns_dash.stdout | default(''))
+
+    - name: Verify DNS resolves {{ domain_base }} to droplet IP
+      command: getent hosts {{ domain_base }}
+      register: dns_root
+      changed_when: false
+
+    - name: Fail if root DNS does not match droplet_ip
+      fail:
+        msg: "DNS for {{ domain_base }} does not resolve to {{ droplet_ip }}. Fix DNS and re-run."
+      when: droplet_ip not in (dns_root.stdout | default(''))
+
+    # ---------------- Certbot (HTTPS) ----------------
+    - name: Obtain/renew certificates via certbot
+      shell: |
+        certbot --nginx \
+          -d api.{{ domain_base }} \
+          -d {{ domain_base }} \
+          -d dashboard.{{ domain_base }} \
+          --redirect -m {{ letsencrypt_email }} --agree-tos -n
+      register: certbot_result
+      changed_when: "'Congratulations' in certbot_result.stdout or 'Congratulations' in certbot_result.stderr or 'No renewals were attempted' not in (certbot_result.stdout + certbot_result.stderr)"
+
+    # ---------------- Firewall tighten-up ----------------
+    - name: Deny raw Convex ports (still reachable locally via Nginx)
+      ufw:
+        rule: deny
+        port: "{{ item }}"
+      loop:
+        - "{{ convex_api_port }}"
+        - "{{ convex_actions_port }}"
+        - "{{ convex_dashboard_port }}"
+
+  post_tasks:
+    - name: Final reminder
+      debug:
+        msg: |
+          ✅ Convex self-hosted is up behind HTTPS.
+          Dashboard: https://dashboard.{{ domain_base }}
+          API:       https://api.{{ domain_base }}
+          Actions:   https://{{ domain_base }}
+
+          Admin key saved to /root/convex_admin_key.txt (rotate it soon).
+          Locally set:
+            CONVEX_SELF_HOSTED_URL=https://api.{{ domain_base }}
+            CONVEX_SELF_HOSTED_ADMIN_KEY=<admin key>
